@@ -1,0 +1,19 @@
+
+# This file can go in one of:
+#  /usr/local/etc/bprsd.conf
+#  /etc/bprsd.conf
+
+# use /var/cache/bprsd/something, needs to be created...
+database:	./bprsd.db
+
+# YOUR callsign, probably your club's or whereever bprsd is being executed
+callsign:	N0CALL
+passcode:	000000
+
+# Coordinates in decimal degrees (not in APRS format! Decimal!)
+# Positive is north and east, negative is south and west
+# The BPRS stations will be announced up to 0.001 degrees to north
+# and east from these coordinates (with a pseudorandom offset).
+latitude:	0.000
+longitude:	0.000
+

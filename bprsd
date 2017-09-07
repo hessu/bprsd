@@ -1,0 +1,357 @@
+#!/usr/bin/perl
+
+#
+#    Copyright (C) 1999-2011 Heikki Hannikainen <hessu@hes.iki.fi>
+#
+
+=head1 NAME
+
+bprsd - Bluetooth Position Reporting System Daemon
+
+=head1 ABSTRACT
+
+This perl program implements the BPRS service. It looks for Bluetooth
+stations nearby the server running the service, and if the bluetooth
+name of those stations match a preconfigured pattern, it announces
+the stations to the APRS-IS using preconfigured coordinates indicating
+the location of the BPRS site. A small, pseudorandom and consistent offset
+is applied to each station to avoid all stations being placed on top of each other.
+
+=head1 SEE ALSO
+
+BPRS documentation (Finnish), L<http://wiki.ham.fi/BPRS>
+
+BPRS documentation (English), L<http://wiki.ham.fi/BPRS.en>
+
+=cut
+
+
+our $VERSION = '1.00';
+
+use strict;
+use warnings;
+use utf8;
+
+use Time::HiRes qw( time sleep );
+
+use Ham::APRS::IS;
+use Ham::APRS::FAP;
+use Data::Dumper;
+use YAML::Tiny;
+use SDBM_File;
+use POSIX;
+use JSON;
+use String::CRC32;
+
+my @cfgfiles = ( '/usr/local/etc/bprsd.conf', '/etc/bprsd.conf' );
+
+my $me = 'bprsd';
+my $debug;
+my $c;
+my $dbh;
+my $db_connection_failed;
+
+my $scan_interval = 60;
+my $poll_interval = 120;
+
+my $scancmd = "hcitool scan --flush --info --oui --class";
+my $pollcmd = "hcitool name";
+
+my %prev_addrs;
+my %this_addrs;
+my @upd_q;
+
+my %db;
+
+my $json = new JSON;
+
+sub push_updates()
+{
+	print "pushing updates...\n";
+	my $is = new Ham::APRS::IS('euro.aprs2.net:14580', $c->{'callsign'},
+		'appid' => 'bprsd ' . $VERSION,
+		'passcode' => $c->{'passcode'});
+	if (!$is) {
+		warn "Failed to create IS server object: " . $is->{'error'} . "\n";
+		return;
+	}
+	
+	my $ret = $is->connect('retryuntil' => 8);
+	if (!$ret) {
+		warn "Failed to connect to IS server: " . $is->{'error'} . "\n";
+		return;
+	}
+	
+	foreach my $ent (@upd_q) {
+		my $seed = crc32($ent->{'call'});
+		print "rand seed for " . $ent->{'call'} . ": $seed\n";
+		srand($seed);
+		my $object = Ham::APRS::FAP::make_object(
+			$ent->{'call'} . '-BP',
+			0,
+			$c->{'latitude'} + rand(1)/1000.0,
+			$c->{'longitude'} + rand(1)/1000.0,
+			'/[',
+			-1,
+			-1,
+			-10000,
+			1,
+			1,
+			0,
+			'BPRS');
+		print "$object\n";
+		
+		my $packet = sprintf('%s>APRS:%s', $c->{'callsign'}, $object);
+		print "$packet\n";
+		$is->sendline($packet);
+	}
+	
+	@upd_q = ();
+	
+	$ret = $is->disconnect();
+	if (!$ret) {
+		warn "Failed to disconnect from IS server: " . $is->{'error'} . "\n";
+	}
+}
+
+sub consider_update($)
+{
+	my($ent) = @_;
+	
+	print "consider_update: " . Dumper($ent);
+	
+	my $oldent = get_ent($ent->{'addr'});
+	
+	if (defined $oldent->{'updated'} && time() - $oldent->{'updated'} < 900) {
+		print "seen lately, not updating\n";
+		return;
+	}
+	
+	$ent->{'updated'} = time();
+	put_ent($ent);
+	push @upd_q, $ent;
+}
+
+sub ent_match_name($)
+{
+	my($ent) = @_;
+	
+	print "checking station name: '" . $ent->{'name'} . "'\n";
+	if ($ent->{'name'} =~ /^bprs\s+([a-z0-9]{4,6})$/i) {
+		$ent->{'call'} = uc($1);
+		print "bprs call: '" . $ent->{'call'} . "'\n";
+		if ($ent->{'call'} =~ /^OH\d[A-Z]{1,3}$/) {
+			# store in database for further queries
+			consider_update($ent);
+		}
+	}
+}
+
+sub parse_entry($)
+{
+	my($s) = @_;
+	
+	$s .= "\n\n";
+	
+	if ($s !~ /^([0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2})/) {
+		print "Entry not parsed: $s\n";
+		return;
+	}
+	my $addr = $1;
+	
+	$this_addrs{$addr} = 1;
+	
+	my %dev;
+	
+	$dev{'addr'} = $addr;
+	
+	if ($s =~ /Device name:\s+([^\n]+?)\n/s) {
+		$dev{'name'} = $1;
+		$dev{'name'} =~ s/\s+\[cached\]$//;
+		undef $dev{'name'} if ($dev{'name'} eq 'n/a');
+	}
+	
+	if ($s =~ /Device class:\s+([^,]+),\s([^\(]+?)\s+\(([0-9a-fx]+)\)\n/s) {
+		$dev{'class_major'} = $1;
+		$dev{'class_minor'} = $2;
+		$dev{'class_id'} = $3;
+	}
+	
+	if ($s =~ /Manufacturer:\s+(.*?)\s+\((\d+)\)\n/s) {
+		$dev{'mfg'} = $1;
+		$dev{'mfg_id'} = $2;
+	}
+	
+	if ($s =~ /LMP version:\s+(\d+\.\d+)\s+\(([^\)]+)\)/s) {
+		$dev{'lmp_ver'} = $1;
+		$dev{'lmp_ver_h'} = $2;
+	}
+	
+	if ($s =~ /LMP features:\s+([^\n]+)\n(.*)\n/s) {
+		$dev{'feathex '}= $1;
+		$dev{'feats'} = $2;
+		$dev{'feats'} =~ s/\s+/ /sg;
+		$dev{'feats'} =~ s/^\s+//sg;
+		$dev{'feats'} =~ s/\s+$//sg;
+	}
+	
+	print "----\n$s\n";
+	foreach my $k (sort keys %dev) {
+		print "$k: $dev{$k}\n" if (defined $dev{$k});
+	}
+	
+	if (defined $dev{'feats'}) {
+		undef $dev{'feats'};
+	}
+	
+	return if (!defined $dev{'name'});
+	
+	$dev{'polled'} = time();
+	
+	ent_match_name(\%dev);
+}
+
+sub scan()
+{
+	print "... scanning ...\n";
+	
+	my $s = `$scancmd`;
+	$s .= "\n\n";
+	
+	print "received: $s";
+	
+	%prev_addrs = %this_addrs;
+	%this_addrs = ();
+	
+	while ($s =~ s/BD Address:\s+(.*?)\n\n//s) {
+		parse_entry($1);
+	}
+}
+
+sub put_ent($)
+{
+	my($ent) = @_;
+	
+	$db{$ent->{'addr'}} = $json->encode($ent);
+}
+
+sub get_ent($)
+{
+	my($addr) = @_;
+	
+	my $oldjson = $db{$addr};
+	my $oldent;
+	if (defined $oldjson) {
+		$oldent = $json->decode($oldjson);
+		if (!$oldent) {
+			print "json decoding failed for $addr: $oldjson\n";
+			delete $db{$addr};
+			return;
+		}
+		
+		return $oldent;
+	}
+	
+	# ouch, not there!
+	delete $db{$addr};
+	return;
+}
+
+sub poll()
+{
+	foreach my $addr (keys %db) {
+		my $ent = get_ent($addr);
+		next if (!$ent);
+		if (time() - $ent->{'polled'} > $poll_interval) {
+			print "$addr has not been polled for $poll_interval, polling\n";
+			poll_single($addr, $ent);
+		} elsif ($ent->{'polled'} > time()) {
+			# time has gone backwards
+			print "time has gone backwards for $addr, polling\n";
+			poll_single($addr, $ent);
+		}
+	}
+}
+
+sub poll_single($$)
+{
+	my($addr, $ent) = @_;
+	
+	if ($addr !~ /^[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}$/) {
+		print "Invalid mac, deleting from DB: $addr\n";
+		delete $db{$addr};
+		return;
+	}
+	
+	$ent->{'polled'} = time();
+	put_ent($ent);
+	
+	print "... polling $addr ...\n";
+	my $s = `$pollcmd $addr`;
+	chomp $s;
+	
+	print "received: '$s'\n";
+	return if ($s eq '');
+	
+	consider_update($ent);
+}
+
+#
+#### Main  #################################################################
+#
+
+my @args = @ARGV;
+while (my $par = shift @args) {
+	if ($par eq "-d") { $debug = 1; print "Debugging...\n"; }
+	elsif ($par eq "-f") { push @cfgfiles, shift @args; }
+	else { print "Unknown parameter \"$par\"\n"; exit(1); }
+}        
+
+# select which config file is present
+my $cfgfile;
+foreach my $f (@cfgfiles) {
+	if ( -f $f ) {
+		$cfgfile = $f;
+		last;
+	}
+}
+
+if (!defined $cfgfile) {
+	die "$me: Could not find a configuration file from: @cfgfiles\n";
+}
+
+warn "$me: Reading YAML configuration from $cfgfile ...\n";
+my $yaml = YAML::Tiny->new;
+$c = YAML::Tiny->read($cfgfile);
+$c = $c->[0];
+
+warn "Config:" . Dumper($c);
+
+tie(%db, 'SDBM_File', $c->{'database'}, O_CREAT|O_RDWR, 0666)
+	|| die "$me: Could not open database: $!\n";
+
+my $next_scan = 0;
+my $min_round_time = 5;
+
+while (1) {
+	my $start_t = time();
+	
+	if (time() > $next_scan) {
+		scan();
+		$next_scan = time() + $scan_interval;
+	} elsif ($next_scan - time() > $scan_interval) {
+		# time has jumped backwards
+		print "Ouch, time has jumped backwards, resetting next_scan\n";
+		$next_scan = time() + $scan_interval;
+	}
+	
+	poll();
+	
+	if (@upd_q) { push_updates(); }
+	my $end_t = time();
+	
+	my $dif = $end_t - $start_t;
+	if ($dif < $min_round_time) {
+		sleep($min_round_time - $dif);
+	}
+}
