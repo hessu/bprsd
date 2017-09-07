@@ -11,15 +11,17 @@ each other.
 
 
 INSTALLATION
+--------------
 
 To install this module type the following:
 
-   perl Makefile.PL
-   make
-   make install
+    perl Makefile.PL
+    make
+    make install
 
 
 DEPENDENCIES
+--------------
 
 perl Makefile.PL should complain about them (and contains a full
 list if needed). It's also listed on the documentation page
@@ -27,18 +29,21 @@ linked below.
 
 
 DOCUMENTATION
+---------------
 
 This module is documented in perldoc format - see 'perldoc bprsd' or
 'man bprsd'.
 
 
 SEE ALSO
+----------
 
-  BPRS documentation (Finnish), [<http://wiki.ham.fi/BPRS]
-  BPRS documentation (English), [<http://wiki.ham.fi/BPRS.en]
+  BPRS documentation (Finnish), [BPRS-fi.md]
+  BPRS documentation (English), [BPRS-en.md]
 
 
 COPYRIGHT AND LICENCE
+-----------------------
 
 Copyright (C) 2010-2030 Heikki Hannikainen
 
