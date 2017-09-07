@@ -38,8 +38,8 @@ This module is documented in perldoc format - see 'perldoc bprsd' or
 SEE ALSO
 ----------
 
-  BPRS documentation (Finnish), [BPRS-fi.md]
-  BPRS documentation (English), [BPRS-en.md]
+ * [BPRS documentation (Finnish)](BPRS-fi.md)
+ * [BPRS documentation (English)](BPRS-en.md)
 
 
 COPYRIGHT AND LICENCE
